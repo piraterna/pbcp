@@ -28,10 +28,10 @@ static size_t packet_to_bits(const uint8_t *pkt, size_t nbytes, uint8_t *bits) {
 }
 
 static size_t bits_to_packet(const uint8_t *bits, size_t nbits, uint8_t *pkt) {
-    size_t nbytes = nbits/8;
-    for(size_t i=0;i<nbytes;i++) {
+    size_t nbytes = nbits / 8;
+    for(size_t i=0; i<nbytes; i++) {
         pkt[i] = 0;
-        for(int b=0;b<8;b++) pkt[i] |= bits[i*8+b] << b;
+        for(int b=0; b<8; b++) pkt[i] |= bits[i*8+b] << b;
     }
     return nbytes;
 }
@@ -39,32 +39,54 @@ static size_t bits_to_packet(const uint8_t *bits, size_t nbits, uint8_t *pkt) {
 static void send_afsk_packet(const pbcp_pkt_header_t *hdr, const uint8_t *payload, afsk_encoder_t *enc) {
     uint8_t pkt_buf[MAX_PACKET_BYTES];
     size_t pkt_len = sizeof(pbcp_pkt_header_t) + hdr->length;
+    if(pkt_len > MAX_PACKET_BYTES) return;
+
     memcpy(pkt_buf, hdr, sizeof(pbcp_pkt_header_t));
-    if(hdr->length>0 && payload) memcpy(pkt_buf+sizeof(pbcp_pkt_header_t), payload, hdr->length);
+    if(hdr->length > 0 && payload)
+        memcpy(pkt_buf + sizeof(pbcp_pkt_header_t), payload, hdr->length);
+
     uint8_t bits[MAX_PACKET_BYTES*8];
     size_t nbits = packet_to_bits(pkt_buf, pkt_len, bits);
     float pcm[PCM_BUFFER_SIZE];
     int nsamples = afsk_encode_bits(enc, bits, nbits, pcm, PCM_BUFFER_SIZE);
+
     pthread_mutex_lock(&tx_to_rx.lock);
-    memcpy(tx_to_rx.buf, pcm, nsamples*sizeof(float));
+    memcpy(tx_to_rx.buf, pcm, nsamples * sizeof(float));
     tx_to_rx.n_samples = nsamples;
     tx_to_rx.ready = 1;
     pthread_cond_signal(&tx_to_rx.cond);
     pthread_mutex_unlock(&tx_to_rx.lock);
 }
 
-static void wait_afsk_packet(pbcp_pkt_header_t *hdr, uint8_t *payload, afsk_decoder_t *dec) {
+static void wait_afsk_packet(pbcp_pkt_header_t *hdr, uint8_t **payload, afsk_decoder_t *dec) {
     pthread_mutex_lock(&tx_to_rx.lock);
     while(!tx_to_rx.ready) pthread_cond_wait(&tx_to_rx.cond, &tx_to_rx.lock);
     float *pcm = tx_to_rx.buf;
     size_t nsamples = tx_to_rx.n_samples;
     tx_to_rx.ready = 0;
     pthread_mutex_unlock(&tx_to_rx.lock);
+
     uint8_t bits[MAX_PACKET_BYTES*8];
     int nbits = afsk_decode_pcm(dec, pcm, nsamples, bits, NULL, sizeof(bits));
-    if(nbits<=0) { fprintf(stderr, "[!] Decode error\n"); return; }
-    bits_to_packet(bits, nbits, (uint8_t*)hdr);
-    if(hdr->length>0 && payload) memcpy(payload, ((uint8_t*)hdr)+sizeof(pbcp_pkt_header_t), hdr->length);
+    if(nbits <= 0) {
+        fprintf(stderr, "[!] Decode error\n");
+        return;
+    }
+
+    uint8_t pkt_buf[MAX_PACKET_BYTES];
+    size_t nbytes = bits_to_packet(bits, nbits, pkt_buf);
+    if(nbytes < sizeof(pbcp_pkt_header_t)) {
+        fprintf(stderr, "[!] Packet too short\n");
+        return;
+    }
+
+    memcpy(hdr, pkt_buf, sizeof(pbcp_pkt_header_t));
+
+    // Allocate/reallocate payload buffer dynamically
+    if(hdr->length > 0) {
+        *payload = realloc(*payload, hdr->length);
+        memcpy(*payload, pkt_buf + sizeof(pbcp_pkt_header_t), hdr->length);
+    }
 }
 
 static int validate_info(const pbcp_payload_info_t *info) {
@@ -79,36 +101,58 @@ void* receiver(void *arg) {
     afsk_encoder_init(&enc, &cfg);
 
     pbcp_pkt_header_t hdr;
-    uint8_t payload[256];
-    char msg_buf[512] = {0};
+    uint8_t *payload = NULL;
+    char msg_buf[8192] = {0}; // big enough buffer
+    size_t msg_offset = 0;
 
     printf("[#] Receiver: Begin Handshake\n");
-    wait_afsk_packet(&hdr, payload, &dec);
+
+    // Wait SYNC
+    wait_afsk_packet(&hdr, &payload, &dec);
     if(hdr.type != PBCP_TYPE_SYNC) return NULL;
+
+    // Send ACK
     pbcp_pkt_header_t ack = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_ACK, 0};
     send_afsk_packet(&ack, NULL, &enc);
     printf("[>] Receiver: Sent ACK\n");
 
-    pbcp_payload_info_t info = {0x12345678,1,0,0};
+    // Send INFO
+    pbcp_payload_info_t info = {0x12345678, 1, 0, 0};
     pbcp_pkt_header_t info_hdr = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_INFO, sizeof(info)};
     send_afsk_packet(&info_hdr, (uint8_t*)&info, &enc);
     printf("[>] Receiver: Sent INFO: ID=0x%08X, FW=%d.%d, Capabilities=0x%02X\n",
            info.receiver_id, info.firmware_major, info.firmware_minor, info.capabilities);
 
-    wait_afsk_packet(&hdr, payload, &dec);
-    if(hdr.type == PBCP_TYPE_ERR) {
-        pbcp_payload_err_t *err = (pbcp_payload_err_t*)payload;
-        fprintf(stderr, "[!] Receiver: Received ERR code 0x%02X (%s)\n", err->code, PBCP_ERROR_STR(err->code));
-        return NULL;
+    // Receive DATA until END
+    while(1) {
+        wait_afsk_packet(&hdr, &payload, &dec);
+        if(hdr.type == PBCP_TYPE_ERR) {
+            pbcp_payload_err_t *err = (pbcp_payload_err_t*)payload;
+            fprintf(stderr, "[!] Receiver: Received ERR code 0x%02X (%s)\n", err->code, PBCP_ERROR_STR(err->code));
+            free(payload);
+            return NULL;
+        }
+
+        if(hdr.type == PBCP_TYPE_DATA) {
+            memcpy(msg_buf + msg_offset, payload, hdr.length);
+            msg_offset += hdr.length;
+            printf("[>] Receiver: Received DATA (hex): ");
+            for(size_t i = 0; i < hdr.length; i++)
+                printf("%02X ", payload[i]);
+            printf("\n");
+        }
+
+        if(hdr.type == PBCP_TYPE_END) {
+            printf("[>] Receiver: Received END\n");
+            pbcp_pkt_header_t final_ack = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_ACK, 0};
+            send_afsk_packet(&final_ack, NULL, &enc);
+            printf("[>] Receiver: Sent final ACK\n");
+            break;
+        }
     }
-    if(hdr.type == PBCP_TYPE_DATA) {
-        memcpy(msg_buf, payload, hdr.length);
-        printf("[>] Receiver: Received DATA (hex): ");
-        for(size_t i = 0; i < hdr.length; i++)
-            printf("%02X ", payload[i]);
-        printf("\n");
-    }
-    printf("[#] Receiver: Handshake complete\nMessage:\n------------------------\n%s\n------------------------\n", msg_buf);
+
+    printf("[#] Receiver: Handshake and transfer complete\nMessage:\n------------------------\n%s\n------------------------\n", msg_buf);
+    free(payload);
     return NULL;
 }
 
@@ -119,24 +163,24 @@ void* transmitter(void *arg) {
     afsk_decoder_t dec;
     afsk_decoder_init(&dec, &cfg);
 
-    const char *msg = "Hello, World!";
+    const char *messages[] = { "Hello, ", "World!" };
+    size_t n_messages = sizeof(messages)/sizeof(messages[0]);
 
     printf("[#] AFSK stream initialized: 1200 bps, 1200/2200 Hz @ 48kHz\n");
+
+    // Send SYNC
     pbcp_pkt_header_t sync = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_SYNC, 0};
     send_afsk_packet(&sync, NULL, &enc);
     printf("[<] Transmitter: Sent SYNC\n");
 
+    // Wait ACK
     pbcp_pkt_header_t hdr;
-    uint8_t payload[256];
-    wait_afsk_packet(&hdr, payload, &dec);
+    uint8_t *payload = NULL;
+    wait_afsk_packet(&hdr, &payload, &dec);
     if(hdr.type == PBCP_TYPE_ACK) printf("[<] Transmitter: Received ACK\n");
 
-    wait_afsk_packet(&hdr, payload, &dec);
-    if(hdr.type == PBCP_TYPE_ERR) {
-        pbcp_payload_err_t *err = (pbcp_payload_err_t*)payload;
-        fprintf(stderr, "[!] Transmitter: Received ERR code 0x%02X\n", err->code);
-        return NULL;
-    }
+    // Wait INFO
+    wait_afsk_packet(&hdr, &payload, &dec);
     if(hdr.type == PBCP_TYPE_INFO) {
         pbcp_payload_info_t *info = (pbcp_payload_info_t*)payload;
         printf("[<] Transmitter: Received INFO: ID=0x%08X, FW=%d.%d, Capabilities=0x%02X\n",
@@ -145,13 +189,28 @@ void* transmitter(void *arg) {
             pbcp_payload_err_t err_pkt = { PBCP_ERR_INVALID_CAPABILITIES };
             pbcp_pkt_header_t err_hdr = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_ERR, sizeof(err_pkt)};
             send_afsk_packet(&err_hdr, (uint8_t*)&err_pkt, &enc);
+            free(payload);
             return NULL;
         }
     }
 
-    pbcp_pkt_header_t data_hdr = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_DATA, (uint16_t)strlen(msg)};
-    send_afsk_packet(&data_hdr, (uint8_t*)msg, &enc);
-    printf("[<] Transmitter: Sent DATA\n");
+    // Send multiple DATA packets
+    for(size_t i = 0; i < n_messages; i++) {
+        pbcp_pkt_header_t data_hdr = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_DATA, (uint16_t)strlen(messages[i])};
+        send_afsk_packet(&data_hdr, (uint8_t*)messages[i], &enc);
+        printf("[<] Transmitter: Sent DATA %zu\n", i+1);
+    }
+
+    // Send END
+    pbcp_pkt_header_t end_hdr = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_END, 0};
+    send_afsk_packet(&end_hdr, NULL, &enc);
+    printf("[<] Transmitter: Sent END\n");
+
+    // Wait final ACK
+    wait_afsk_packet(&hdr, &payload, &dec);
+    if(hdr.type == PBCP_TYPE_ACK) printf("[<] Transmitter: Received final ACK\n");
+
+    free(payload);
     printf("[#] Transmitter: Transfer complete\n");
     return NULL;
 }
