@@ -7,7 +7,7 @@
 #include <portaudio.h>
 #include <unistd.h>
 
-#define PCM_BUFFER_SIZE 2048
+#define PCM_BUFFER_SIZE 1024
 #define SYNC_RETRY_US 500000  // 0.5s
 #define SYNC_MAX_RETRIES 20
 

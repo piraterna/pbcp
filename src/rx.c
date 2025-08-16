@@ -8,7 +8,7 @@
 #include <unistd.h>
 #include <math.h>
 
-#define PCM_BUFFER_SIZE 256
+#define PCM_BUFFER_SIZE 1024
 #define MAX_PACKET_BYTES 1024
 #define SYNC_RETRY_LOG 5000
 
