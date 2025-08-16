@@ -1,3 +1,3 @@
-# pwcp
+# pbcp
 
-Piraterna's Wideband Communication Protocol
+Piraterna's Baseband Communication Protocol
