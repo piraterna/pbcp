@@ -10,6 +10,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(portaudio)
 
+add_executable(test test.c)
+target_include_directories(test PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/lib
+        ${portaudio_SOURCE_DIR}/include
+)
+target_link_libraries(test PRIVATE afsk portaudio)
+
 # -------------------
 # Transmitter executable
 # -------------------

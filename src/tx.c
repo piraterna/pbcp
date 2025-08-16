@@ -64,7 +64,7 @@ int recv_packet(PaStream *stream, afsk_decoder_t *dec, pbcp_pkt_header_t *hdr, u
 // ---------------- Main TX ----------------
 int main() {
     afsk_config_t cfg = {
-        .sample_rate = 48000.0,
+        .sample_rate = 44100.0,
         .baud = 1200.0,
         .f_mark = 1200.0,
         .f_space = 2200.0,
