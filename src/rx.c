@@ -72,7 +72,7 @@ int send_packet(PaStream *stream, afsk_encoder_t *enc, const pbcp_pkt_header_t *
 }
 
 int main() {
-    printf("[#] RX starting: sample_rate=%.2f, baud=%.1f\n", SAMPLE_RATE, BAUD);
+    printf("[#] RX starting: sample_rate=%.2f, baud=%.1f\n", 44100.0, 1200.0);
 
     afsk_config_t cfg = {
         .sample_rate = 44100.0,
@@ -122,7 +122,7 @@ int main() {
     };
 
     PaStream *stream = NULL;
-    err = Pa_OpenStream(&stream, &inputParams, &outputParams, SAMPLE_RATE, PCM_BUFFER_SIZE, paClipOff, NULL, NULL);
+    err = Pa_OpenStream(&stream, &inputParams, &outputParams, 44100, PCM_BUFFER_SIZE, paClipOff, NULL, NULL);
     if (err != paNoError) { fprintf(stderr, "[ERROR] Pa_OpenStream failed: %s\n", Pa_GetErrorText(err)); return 1; }
 
     err = Pa_StartStream(stream);
