@@ -1,136 +1,167 @@
-#include "afsk.h"
+#include "protocol.h"
+#include "afsk/afsk.h"
 #include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
 #include <stdint.h>
-#include <time.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <stdlib.h>
 
-static void write_wav_header(FILE *f, int sample_rate, int nsamples) {
-    int bits_per_sample = 16;
-    int num_channels = 1;
-    int byte_rate = sample_rate * num_channels * bits_per_sample / 8;
-    int block_align = num_channels * bits_per_sample / 8;
-    int data_chunk_size = nsamples * block_align;
-    int fmt_chunk_size = 16;
-    int riff_chunk_size = 4 + (8 + fmt_chunk_size) + (8 + data_chunk_size);
+#define MAX_PACKET_BYTES 1024
+#define PCM_BUFFER_SIZE  48000
+#define BITS_PER_BYTE    8
 
-    /* RIFF header */
-    fwrite("RIFF", 1, 4, f);
-    uint32_t val32 = riff_chunk_size;
-    fwrite(&val32, 4, 1, f);
-    fwrite("WAVE", 1, 4, f);
+typedef struct {
+    float buf[PCM_BUFFER_SIZE];
+    size_t n_samples;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    int ready;
+} audio_channel_t;
 
-    /* fmt chunk */
-    fwrite("fmt ", 1, 4, f);
-    val32 = fmt_chunk_size;
-    fwrite(&val32, 4, 1, f);
-    uint16_t val16 = 1; // PCM
-    fwrite(&val16, 2, 1, f);
-    val16 = num_channels;
-    fwrite(&val16, 2, 1, f);
-    val32 = sample_rate;
-    fwrite(&val32, 4, 1, f);
-    val32 = byte_rate;
-    fwrite(&val32, 4, 1, f);
-    val16 = block_align;
-    fwrite(&val16, 2, 1, f);
-    val16 = bits_per_sample;
-    fwrite(&val16, 2, 1, f);
+audio_channel_t tx_to_rx = { .lock=PTHREAD_MUTEX_INITIALIZER, .cond=PTHREAD_COND_INITIALIZER, .ready=0 };
 
-    /* data chunk */
-    fwrite("data", 1, 4, f);
-    val32 = data_chunk_size;
-    fwrite(&val32, 4, 1, f);
+static size_t packet_to_bits(const uint8_t *pkt, size_t nbytes, uint8_t *bits) {
+    for(size_t i=0;i<nbytes;i++)
+        for(int b=0;b<8;b++) bits[i*8+b] = (pkt[i] >> b) & 1;
+    return nbytes*8;
 }
 
-int main(void) {
-    /* Bell 202-ish defaults: 1200 baud, mark=1200 Hz, space=2200 Hz @ 48 kHz */
-    afsk_config_t cfg = {
-        .sample_rate = 48000.0,
-        .baud = 1200.0,
-        .f_mark = 1200.0,
-        .f_space = 2200.0,
-        .amplitude = 0.8,
-        .hard_decisions = 0
-    };
+static size_t bits_to_packet(const uint8_t *bits, size_t nbits, uint8_t *pkt) {
+    size_t nbytes = nbits/8;
+    for(size_t i=0;i<nbytes;i++) {
+        pkt[i] = 0;
+        for(int b=0;b<8;b++) pkt[i] |= bits[i*8+b] << b;
+    }
+    return nbytes;
+}
 
-    afsk_encoder_t enc;
+static void send_afsk_packet(const pbcp_pkt_header_t *hdr, const uint8_t *payload, afsk_encoder_t *enc) {
+    uint8_t pkt_buf[MAX_PACKET_BYTES];
+    size_t pkt_len = sizeof(pbcp_pkt_header_t) + hdr->length;
+    memcpy(pkt_buf, hdr, sizeof(pbcp_pkt_header_t));
+    if(hdr->length>0 && payload) memcpy(pkt_buf+sizeof(pbcp_pkt_header_t), payload, hdr->length);
+    uint8_t bits[MAX_PACKET_BYTES*8];
+    size_t nbits = packet_to_bits(pkt_buf, pkt_len, bits);
+    float pcm[PCM_BUFFER_SIZE];
+    int nsamples = afsk_encode_bits(enc, bits, nbits, pcm, PCM_BUFFER_SIZE);
+    pthread_mutex_lock(&tx_to_rx.lock);
+    memcpy(tx_to_rx.buf, pcm, nsamples*sizeof(float));
+    tx_to_rx.n_samples = nsamples;
+    tx_to_rx.ready = 1;
+    pthread_cond_signal(&tx_to_rx.cond);
+    pthread_mutex_unlock(&tx_to_rx.lock);
+}
+
+static void wait_afsk_packet(pbcp_pkt_header_t *hdr, uint8_t *payload, afsk_decoder_t *dec) {
+    pthread_mutex_lock(&tx_to_rx.lock);
+    while(!tx_to_rx.ready) pthread_cond_wait(&tx_to_rx.cond, &tx_to_rx.lock);
+    float *pcm = tx_to_rx.buf;
+    size_t nsamples = tx_to_rx.n_samples;
+    tx_to_rx.ready = 0;
+    pthread_mutex_unlock(&tx_to_rx.lock);
+    uint8_t bits[MAX_PACKET_BYTES*8];
+    int nbits = afsk_decode_pcm(dec, pcm, nsamples, bits, NULL, sizeof(bits));
+    if(nbits<=0) { fprintf(stderr, "[!] Decode error\n"); return; }
+    bits_to_packet(bits, nbits, (uint8_t*)hdr);
+    if(hdr->length>0 && payload) memcpy(payload, ((uint8_t*)hdr)+sizeof(pbcp_pkt_header_t), hdr->length);
+}
+
+static int validate_info(const pbcp_payload_info_t *info) {
+    return info->capabilities == 0x00; // capabilities are unimplemented
+}
+
+void* receiver(void *arg) {
     afsk_decoder_t dec;
+    afsk_config_t cfg = {48000, 1200, 1200, 2200, 0.9, 1};
+    afsk_decoder_init(&dec, &cfg);
+    afsk_encoder_t enc;
     afsk_encoder_init(&enc, &cfg);
+
+    pbcp_pkt_header_t hdr;
+    uint8_t payload[256];
+    char msg_buf[512] = {0};
+
+    printf("[#] Receiver: Begin Handshake\n");
+    wait_afsk_packet(&hdr, payload, &dec);
+    if(hdr.type != PBCP_TYPE_SYNC) return NULL;
+    pbcp_pkt_header_t ack = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_ACK, 0};
+    send_afsk_packet(&ack, NULL, &enc);
+    printf("[>] Receiver: Sent ACK\n");
+
+    pbcp_payload_info_t info = {0x12345678,1,0,0};
+    pbcp_pkt_header_t info_hdr = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_INFO, sizeof(info)};
+    send_afsk_packet(&info_hdr, (uint8_t*)&info, &enc);
+    printf("[>] Receiver: Sent INFO: ID=0x%08X, FW=%d.%d, Capabilities=0x%02X\n",
+           info.receiver_id, info.firmware_major, info.firmware_minor, info.capabilities);
+
+    wait_afsk_packet(&hdr, payload, &dec);
+    if(hdr.type == PBCP_TYPE_ERR) {
+        pbcp_payload_err_t *err = (pbcp_payload_err_t*)payload;
+        fprintf(stderr, "[!] Receiver: Received ERR code 0x%02X (%s)\n", err->code, PBCP_ERROR_STR(err->code));
+        return NULL;
+    }
+    if(hdr.type == PBCP_TYPE_DATA) {
+        memcpy(msg_buf, payload, hdr.length);
+        printf("[>] Receiver: Received DATA (hex): ");
+        for(size_t i = 0; i < hdr.length; i++)
+            printf("%02X ", payload[i]);
+        printf("\n");
+    }
+    printf("[#] Receiver: Handshake complete\nMessage:\n------------------------\n%s\n------------------------\n", msg_buf);
+    return NULL;
+}
+
+void* transmitter(void *arg) {
+    afsk_encoder_t enc;
+    afsk_config_t cfg = {48000, 1200, 1200, 2200, 0.9, 1};
+    afsk_encoder_init(&enc, &cfg);
+    afsk_decoder_t dec;
     afsk_decoder_init(&dec, &cfg);
 
-    /* Generate ~5 seconds worth of random bits */
-    int target_seconds = 5;
-    size_t nbits = (size_t)(cfg.baud * target_seconds);
+    const char *msg = "Hello, World!";
 
-    uint8_t *bits = malloc(nbits);
-    srand((unsigned)time(NULL));
-    for (size_t i = 0; i < nbits; i++) {
-        bits[i] = rand() & 1;
+    printf("[#] AFSK stream initialized: 1200 bps, 1200/2200 Hz @ 48kHz\n");
+    pbcp_pkt_header_t sync = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_SYNC, 0};
+    send_afsk_packet(&sync, NULL, &enc);
+    printf("[<] Transmitter: Sent SYNC\n");
+
+    pbcp_pkt_header_t hdr;
+    uint8_t payload[256];
+    wait_afsk_packet(&hdr, payload, &dec);
+    if(hdr.type == PBCP_TYPE_ACK) printf("[<] Transmitter: Received ACK\n");
+
+    wait_afsk_packet(&hdr, payload, &dec);
+    if(hdr.type == PBCP_TYPE_ERR) {
+        pbcp_payload_err_t *err = (pbcp_payload_err_t*)payload;
+        fprintf(stderr, "[!] Transmitter: Received ERR code 0x%02X\n", err->code);
+        return NULL;
     }
-
-    /* Allocate PCM buffer */
-    size_t approx_samples = (size_t)((cfg.sample_rate / cfg.baud) * nbits + 8);
-    float *pcm = malloc(sizeof(float) * approx_samples);
-
-    int nsamp = afsk_encode_bits(&enc, bits, nbits, pcm, approx_samples);
-    if (nsamp <= 0) { fprintf(stderr, "encode failed\n"); return 1; }
-
-    /* Write WAV file */
-    FILE *fwav = fopen("afsk.wav", "wb");
-    if (!fwav) { perror("fopen"); return 1; }
-    write_wav_header(fwav, (int)cfg.sample_rate, nsamp);
-
-    for (int i = 0; i < nsamp; i++) {
-        float s = pcm[i];
-        if (s > 1.0f) s = 1.0f;
-        if (s < -1.0f) s = -1.0f;
-        int16_t si = (int16_t)(s * 32767.0f);
-        fwrite(&si, sizeof(int16_t), 1, fwav);
-    }
-
-    fclose(fwav);
-    printf("Wrote %d samples (%.2f sec) to afsk.wav\n",
-           nsamp, nsamp / cfg.sample_rate);
-
-    /* Decode PCM back into bits */
-    uint8_t *rx_bits = malloc(nbits);
-    double  *soft = malloc(sizeof(double) * nbits);
-
-    int got = afsk_decode_pcm(&dec, pcm, nsamp, rx_bits, soft, nbits);
-
-    /* Compare original vs decoded */
-    size_t errors = 0;
-    size_t compared = (got < (int)nbits) ? got : nbits;
-    for (size_t i = 0; i < compared; i++) {
-        if (bits[i] != rx_bits[i]) {
-            errors++;
+    if(hdr.type == PBCP_TYPE_INFO) {
+        pbcp_payload_info_t *info = (pbcp_payload_info_t*)payload;
+        printf("[<] Transmitter: Received INFO: ID=0x%08X, FW=%d.%d, Capabilities=0x%02X\n",
+               info->receiver_id, info->firmware_major, info->firmware_minor, info->capabilities);
+        if(!validate_info(info)) {
+            pbcp_payload_err_t err_pkt = { PBCP_ERR_INVALID_CAPABILITIES };
+            pbcp_pkt_header_t err_hdr = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_ERR, sizeof(err_pkt)};
+            send_afsk_packet(&err_hdr, (uint8_t*)&err_pkt, &enc);
+            return NULL;
         }
     }
 
-    double ber = compared ? ((double)errors / (double)compared) : 0.0;
+    pbcp_pkt_header_t data_hdr = {PBCP_PREAMBLE, PBCP_MAGIC, PBCP_TYPE_DATA, (uint16_t)strlen(msg)};
+    send_afsk_packet(&data_hdr, (uint8_t*)msg, &enc);
+    printf("[<] Transmitter: Sent DATA\n");
+    printf("[#] Transmitter: Transfer complete\n");
+    return NULL;
+}
 
-    printf("\n==== AFSK Loopback Test ====\n");
-    printf("Config: %.0f baud, mark=%.0f Hz, space=%.0f Hz, Fs=%.0f Hz\n",
-           cfg.baud, cfg.f_mark, cfg.f_space, cfg.sample_rate);
-    printf("Generated bits : %zu\n", nbits);
-    printf("Decoded bits   : %d\n", got);
-    printf("Compared bits  : %zu\n", compared);
-    printf("Bit errors     : %zu\n", errors);
-    printf("Bit Error Rate : %.6f\n", ber);
-
-    /* Print first 64 bits side-by-side for inspection */
-    size_t show = (compared < 64) ? compared : 64;
-    printf("\nFirst %zu bits:\n", show);
-    printf("TX: ");
-    for (size_t i = 0; i < show; i++) printf("%d", bits[i]);
-    printf("\nRX: ");
-    for (size_t i = 0; i < show; i++) printf("%d", rx_bits[i]);
-    printf("\n");
-
-    free(bits);
-    free(pcm);
-    free(rx_bits);
-    free(soft);
+int main() {
+    pthread_t rx, tx;
+    pthread_create(&rx, NULL, receiver, NULL);
+    sleep(1);
+    pthread_create(&tx, NULL, transmitter, NULL);
+    pthread_join(tx, NULL);
+    pthread_join(rx, NULL);
     return 0;
 }

@@ -14,7 +14,7 @@ sequenceDiagram
 
     TX->>RX: SYNC (request communication)
     RX-->>TX: ACK (acknowledge)
-    RX-->>TX: INFO (optional: ID, version, capabilities)
+    RX-->>TX: INFO (ID, version, capabilities)
     TX->>RX: DATA (payload 1)
     TX->>RX: DATA (payload 2)
     TX->>RX: END (end of transmission)
