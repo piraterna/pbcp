@@ -11,16 +11,12 @@ static double clamp(double v, double lo, double hi) {
     return (v < lo) ? lo : (v > hi) ? hi : v;
 }
 
-/* Compute Goertzel coefficient for target frequency ft over N samples @ Fs:
- * coeff = 2*cos(2*pi*ft/Fs)
- */
+/* ft over N samples @ Fs: coeff = 2*cos(2*pi*ft/Fs) */
 static double goertzel_coeff(double ft, double Fs) {
     return 2.0 * cos(2.0 * M_PI * ft / Fs);
 }
 
-/* Power from Goertzel state after N samples:
- * P = s1^2 + s2^2 - coeff*s1*s2
- */
+/* Power from Goertzel state after N samples: P = s1^2 + s2^2 - coeff*s1*s2 */
 static double goertzel_power(double s1, double s2, double coeff) {
     return s1*s1 + s2*s2 - coeff*s1*s2;
 }

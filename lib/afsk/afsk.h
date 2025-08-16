@@ -1,15 +1,3 @@
-/*
- * ============================================================================
- * afsk.h - Utility library for encoding and decoding AFSK samples
- *           based on a mark and a space frequency (fixed baud)
- *
- * License:
- * --------
- * Apache License 2.0 (see LICENSE file or
- * https://www.apache.org/licenses/LICENSE-2.0)
- * ============================================================================
- */
-
 #ifndef LIB_AFSK_H
 #define LIB_AFSK_H
 
@@ -54,7 +42,6 @@ typedef struct {
     int    cur_is_mark;  /* current tone selection */
 } afsk_encoder_t;
 
-/* Initialize encoder */
 afsk_status_t afsk_encoder_init(afsk_encoder_t *enc, const afsk_config_t *cfg);
 
 /* Generate samples for a buffer of bits (LSB first or MSB first is up to caller).
@@ -71,9 +58,7 @@ afsk_status_t afsk_encoder_init(afsk_encoder_t *enc, const afsk_config_t *cfg);
 int afsk_encode_bits(afsk_encoder_t *enc, const uint8_t *bits, size_t nbits,
                      float *out, size_t out_len);
 
-/* ========= Decoder (Goertzel) =========
- * Simple symbol-rate Goertzel: we integrate over ~one symbol window.
- */
+/* ========= Decoder (using Goertzel algorithm) ======== */
 typedef struct {
     /* config copy */
     afsk_config_t cfg;
@@ -96,7 +81,6 @@ typedef struct {
        else: we fill bits_out and also soft_out with +metric (mark-space power) */
 } afsk_decoder_t;
 
-/* Initialize decoder */
 afsk_status_t afsk_decoder_init(afsk_decoder_t *dec, const afsk_config_t *cfg);
 
 /* Feed PCM samples. PCM is expected in [-1,1].
