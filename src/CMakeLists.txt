@@ -1,10 +1,33 @@
-file(GLOB SRC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.c")
+cmake_minimum_required(VERSION 3.16)
+project(PBCP C)
 
-add_executable(pwcp ${SRC_SOURCES})
+include(FetchContent)
 
-target_include_directories(pwcp PRIVATE
+FetchContent_Declare(
+        portaudio
+        GIT_REPOSITORY https://github.com/PortAudio/portaudio.git
+        GIT_TAG        master
+)
+FetchContent_MakeAvailable(portaudio)
+
+# -------------------
+# Transmitter executable
+# -------------------
+add_executable(tx tx.c)
+target_include_directories(tx PRIVATE
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/lib
+        ${portaudio_SOURCE_DIR}/include
 )
+target_link_libraries(tx PRIVATE afsk portaudio)
 
-target_link_libraries(pwcp PRIVATE afsk)
+# -------------------
+# Receiver executable
+# -------------------
+add_executable(rx rx.c)
+target_include_directories(rx PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/lib
+        ${portaudio_SOURCE_DIR}/include
+)
+target_link_libraries(rx PRIVATE afsk portaudio)
