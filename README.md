@@ -20,3 +20,7 @@ sequenceDiagram
     TX->>RX: END (end of transmission)
     RX-->>TX: ACK (confirm full reception)
 ```
+
+## TODO
+
+Fix the stupid rx.c and tx.c, they dont work.
